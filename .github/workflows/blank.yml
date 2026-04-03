@@ -22,8 +22,8 @@ jobs:
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-bf16
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-bf16
 
-      HUMANEVAL_LIMIT: "6"
-      MAX_NEW_TOKENS_CODE: "192"
+      HUMANEVAL_LIMIT: "4"
+      MAX_NEW_TOKENS_CODE: "96"
       EXEC_TIMEOUT_SECONDS: "4"
 
     steps:
@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-gap-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-gap-v2
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-gap-
             ${{ runner.os }}-${{ runner.arch }}-pip-
@@ -48,7 +48,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-gap-qwen25-1p5b-0p5b-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-gap-qwen25-1p5b-0p5b-v2
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-gap-qwen25-1p5b-0p5b-
             ${{ runner.os }}-${{ runner.arch }}-hf-
@@ -79,11 +79,11 @@ jobs:
           import textwrap
           import time
           import traceback
-          from collections import defaultdict
 
           import mlx.core as mx
           from datasets import load_dataset
           from mlx_lm import load
+
 
           OUT_DIR = os.environ["OUT_DIR"]
           TEACHER_MODEL = os.environ["TEACHER_MODEL"]
@@ -92,18 +92,22 @@ jobs:
           MAX_NEW_TOKENS_CODE = int(os.environ["MAX_NEW_TOKENS_CODE"])
           EXEC_TIMEOUT_SECONDS = int(os.environ["EXEC_TIMEOUT_SECONDS"])
 
+
           def now():
               return time.perf_counter()
+
 
           def banner(title):
               print("\n" + "=" * 140)
               print(title)
               print("=" * 140)
 
+
           def section(title):
               print("\n" + "-" * 140)
               print(title)
               print("-" * 140)
+
 
           def greedy_generate(model, tok, prompt, max_new_tokens):
               prompt_ids = tok.encode(prompt)
@@ -135,22 +139,62 @@ jobs:
                   "tps": (len(out) / elapsed) if elapsed > 0 else 0.0,
               }
 
-          def extract_code(text):
-              if text is None:
+
+          def extract_code_block(text):
+              if not text:
                   return ""
               m = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
               if m:
                   return m.group(1).strip()
               return text.strip()
 
-          def build_prompt(task):
+
+          def stop_at_obvious_repetition(text):
+              lines = text.splitlines()
+              kept = []
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith("def "):
+                      break
+                  if stripped.startswith("from ") or stripped.startswith("import "):
+                      break
+                  if stripped.startswith('"""') or stripped.startswith("'''"):
+                      break
+                  kept.append(line)
+              return "\n".join(kept).rstrip()
+
+
+          def normalize_body(text):
+              code = extract_code_block(text)
+              code = stop_at_obvious_repetition(code)
+              code = code.replace("\t", "    ").strip("\n")
+
+              lines = code.splitlines()
+              cleaned = []
+              for line in lines:
+                  if line.strip() == "":
+                      cleaned.append("")
+                      continue
+                  cleaned.append(line.lstrip())
+
+              body = "\n".join(cleaned).strip()
+              if not body:
+                  body = "pass"
+              return textwrap.indent(body, "    ")
+
+
+          def build_generation_prompt(task):
               return (
-                  "You are solving a HumanEval Python coding task.\n"
-                  "Return only Python code for the function body and helper functions.\n"
-                  "Do not include explanations.\n"
-                  "Prefer a complete correct solution.\n\n"
+                  "Complete the Python function below.\n"
+                  "Return ONLY the function body statements.\n"
+                  "Do NOT repeat the function signature.\n"
+                  "Do NOT repeat the docstring.\n"
+                  "Do NOT add markdown fences.\n"
+                  "Start directly with the first indented line of the body.\n\n"
                   f"{task['prompt']}\n"
+                  "# Function body starts here:\n"
               )
+
 
           def load_tasks():
               section("[1] LOAD HUMANEVAL DATA")
@@ -168,34 +212,36 @@ jobs:
               print(f"[DATA SUMMARY] humaneval_items={len(tasks)}")
               return tasks
 
-          def _exec_worker(code, test_code, queue):
+
+          def _exec_worker(code, queue):
               try:
                   ns = {}
                   exec(code, ns, ns)
-                  exec(test_code, ns, ns)
                   queue.put({"passed": True, "error": None})
               except Exception:
                   queue.put({"passed": False, "error": traceback.format_exc()})
 
-          def run_tests(candidate_code, task):
-              code = extract_code(candidate_code)
-              full_code = task["prompt"] + "\n" + code + "\n" + task["test"] + f"\ncheck({task['entry_point']})\n"
+
+          def run_tests(candidate_body_text, task):
+              body = normalize_body(candidate_body_text)
+              full_code = task["prompt"] + "\n" + body + "\n" + task["test"] + f"\ncheck({task['entry_point']})\n"
 
               queue = mp.Queue()
-              p = mp.Process(target=_exec_worker, args=(full_code, "", queue))
+              p = mp.Process(target=_exec_worker, args=(full_code, queue))
               p.start()
               p.join(EXEC_TIMEOUT_SECONDS)
 
               if p.is_alive():
                   p.terminate()
                   p.join()
-                  return False, "Execution timed out", full_code
+                  return False, "Execution timed out", full_code, body
 
               if queue.empty():
-                  return False, "No result returned", full_code
+                  return False, "No result returned", full_code, body
 
               result = queue.get()
-              return result["passed"], result["error"], full_code
+              return result["passed"], result["error"], full_code, body
+
 
           def run_model(model_name, tasks, role_name):
               section(f"[2] LOAD {role_name.upper()} MODEL")
@@ -213,15 +259,15 @@ jobs:
                   print("[PROMPT PREVIEW]")
                   print(task["prompt"][:500])
 
-                  gen = greedy_generate(model, tok, build_prompt(task), task["max_new_tokens"])
-                  passed, error, full_code = run_tests(gen["text"], task)
+                  gen = greedy_generate(model, tok, build_generation_prompt(task), task["max_new_tokens"])
+                  passed, error, full_code, body = run_tests(gen["text"], task)
                   tps_values.append(gen["tps"])
 
                   item = {
                       "task_id": task["task_id"],
                       "entry_point": task["entry_point"],
                       "raw_output": gen["text"],
-                      "candidate_code": extract_code(gen["text"]),
+                      "candidate_body": body,
                       "passed": passed,
                       "error": error,
                       "generated_tokens": gen["generated_tokens"],
@@ -235,7 +281,8 @@ jobs:
                   print(f"[ITEM RESULT] role={role_name} generated_tokens={gen['generated_tokens']} seconds={gen['elapsed']:.4f} tps={gen['tps']:.4f}")
                   if error:
                       print(f"[ITEM ERROR] {error[:800]}")
-                  print(f"[RAW OUTPUT] {repr(gen['text'][:500])}")
+                  print(f"[RAW OUTPUT] {repr(gen['text'][:400])}")
+                  print(f"[NORMALIZED BODY] {repr(body[:400])}")
 
               summary = {
                   "role": role_name,
@@ -249,6 +296,7 @@ jobs:
               }
 
               return outputs, summary
+
 
           def compare(tasks, teacher_outputs, student_outputs):
               section("[4] COMPARE TEACHER VS STUDENT")
@@ -286,9 +334,11 @@ jobs:
                       "prompt": task["prompt"],
                       "teacher_passed": t["passed"],
                       "teacher_output": t["raw_output"],
+                      "teacher_body": t["candidate_body"],
                       "teacher_error": t["error"],
                       "student_passed": s["passed"],
                       "student_output": s["raw_output"],
+                      "student_body": s["candidate_body"],
                       "student_error": s["error"],
                   }
                   verbose_rows.append(row)
@@ -296,19 +346,18 @@ jobs:
                   print(f"[COMPARE] task_id={tid} bucket={bucket}")
                   if bucket == "teacher_only_pass":
                       print("[EDGE FOUND] Teacher passed where student failed.")
-                      print(f"[EDGE TEACHER OUTPUT] {repr(t['raw_output'][:300])}")
-                      print(f"[EDGE STUDENT OUTPUT] {repr(s['raw_output'][:300])}")
+                      print(f"[EDGE TEACHER BODY] {repr(t['candidate_body'][:300])}")
+                      print(f"[EDGE STUDENT BODY] {repr(s['candidate_body'][:300])}")
                       if s["error"]:
                           print(f"[EDGE STUDENT ERROR] {s['error'][:500]}")
 
               teacher_only = [r for r in verbose_rows if r["bucket"] == "teacher_only_pass"]
-
               summary = {
                   "overall": counts,
                   "teacher_only_pass_examples": len(teacher_only),
               }
-
               return verbose_rows, teacher_only, summary
+
 
           def write_markdown_report(teacher_summary, student_summary, comparison_summary, teacher_only_rows):
               path = os.path.join(OUT_DIR, "report.md")
@@ -320,13 +369,14 @@ jobs:
                   for row in teacher_only_rows:
                       f.write(f"### {row['task_id']}\n")
                       f.write(f"- Entry point: `{row['entry_point']}`\n")
-                      f.write(f"- Prompt: \n```python\n{row['prompt']}\n```\n")
-                      f.write(f"- Teacher output:\n```python\n{row['teacher_output'][:1200]}\n```\n")
-                      f.write(f"- Student output:\n```python\n{row['student_output'][:1200]}\n```\n")
+                      f.write(f"- Prompt:\n```python\n{row['prompt']}\n```\n")
+                      f.write(f"- Teacher body:\n```python\n{row['teacher_body'][:1200]}\n```\n")
+                      f.write(f"- Student body:\n```python\n{row['student_body'][:1200]}\n```\n")
                       if row["student_error"]:
                           f.write(f"- Student error:\n```text\n{row['student_error'][:1200]}\n```\n")
                       f.write("\n")
               return path
+
 
           def write_step_summary(teacher_summary, student_summary, comparison_summary):
               step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -340,6 +390,7 @@ jobs:
                   f.write(f"- Student-only-pass: **{comparison_summary['overall']['student_only_pass']}**\n")
                   f.write(f"- Both pass: **{comparison_summary['overall']['both_pass']}**\n")
                   f.write(f"- Both fail: **{comparison_summary['overall']['both_fail']}**\n")
+
 
           def print_console_summary(teacher_summary, student_summary, comparison_summary_serializable, teacher_only_rows, report_path):
               section("[5] FINAL CONSOLE SUMMARY")
@@ -375,8 +426,8 @@ jobs:
                       print(f"TASK: {row['task_id']} | entry_point={row['entry_point']}")
                       print(f"Teacher passed={row['teacher_passed']} | Student passed={row['student_passed']}")
                       print(f"Prompt: {row['prompt'][:300]}")
-                      print(f"Teacher output: {row['teacher_output'][:300]}")
-                      print(f"Student output: {row['student_output'][:300]}")
+                      print(f"Teacher body: {row['teacher_body'][:300]}")
+                      print(f"Student body: {row['student_body'][:300]}")
                       if row["student_error"]:
                           print(f"Student error: {row['student_error'][:300]}")
                       print("-" * 140)
@@ -401,6 +452,7 @@ jobs:
                   "report_path": report_path,
               }
               print(json.dumps(final_summary, indent=2))
+
 
           def main():
               mp.set_start_method("fork", force=True)
@@ -461,6 +513,7 @@ jobs:
                   teacher_only_rows,
                   report_path,
               )
+
 
           if __name__ == "__main__":
               main()
