@@ -22,10 +22,10 @@ jobs:
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-bf16
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-bf16
 
-      GSM8K_LIMIT: "8"
-      ARC_LIMIT: "24"
-      MAX_NEW_TOKENS_GSM8K: "128"
-      MAX_NEW_TOKENS_ARC: "32"
+      GSM8K_LIMIT: "4"
+      ARC_LIMIT: "8"
+      MAX_NEW_TOKENS_GSM8K: "96"
+      MAX_NEW_TOKENS_ARC: "16"
 
     steps:
       - name: Checkout Repository
@@ -40,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ runner.arch }}-pip-benchmark-gap-v2
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-benchmark-gap-v3
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-pip-benchmark-gap-
             ${{ runner.os }}-${{ runner.arch }}-pip-
@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-benchmark-gap-qwen25-1p5b-0p5b-v2
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-benchmark-gap-qwen25-1p5b-0p5b-v3
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-hf-benchmark-gap-qwen25-1p5b-0p5b-
             ${{ runner.os }}-${{ runner.arch }}-hf-
@@ -116,7 +116,7 @@ jobs:
                   token_id = int(nxt.item())
                   out.append(token_id)
 
-                  if i < 4 or (i + 1) % 16 == 0:
+                  if i < 4 or (i + 1) % 8 == 0:
                       recent = tok.decode(out[-8:])
                       print(f"[GEN TRACE] step={i+1:03d} token_id={token_id} recent={repr(recent)}")
 
@@ -152,24 +152,22 @@ jobs:
           def extract_arc_pred(text):
               if text is None:
                   return None
-              matches = re.findall(r"\b([A-E])\b", text.upper())
+              final = extract_final_answer_line(text)
+              matches = re.findall(r"\b([A-E])\b", final.upper())
               return matches[-1] if matches else None
 
           def build_gsm8k_prompt(question):
               return (
-                  "You are solving a GSM8K math word problem.\n"
-                  "Think briefly if needed, but end with exactly one line in this format:\n"
-                  "FINAL_ANSWER: <number>\n\n"
+                  "Solve this GSM8K math problem. "
+                  "End with exactly one line: FINAL_ANSWER: <number>\n\n"
                   f"Question:\n{question}\n"
               )
 
           def build_arc_prompt(question, labels, texts):
               choices = "\n".join([f"{lab}. {txt}" for lab, txt in zip(labels, texts)])
               return (
-                  "You are answering a multiple-choice science question from ARC-Challenge.\n"
-                  "Choose the single best option.\n"
-                  "End with exactly one line in this format:\n"
-                  "FINAL_ANSWER: <A/B/C/D/E>\n\n"
+                  "Answer this multiple-choice question. "
+                  "Return only one final line: FINAL_ANSWER: <A/B/C/D/E>\n\n"
                   f"Question:\n{question}\n\n"
                   f"Choices:\n{choices}\n"
               )
@@ -178,7 +176,9 @@ jobs:
               if text is None:
                   return None
               m = re.search(r"FINAL_ANSWER:\s*(.+)", text, re.IGNORECASE)
-              return m.group(1).strip() if m else text.strip()
+              if m:
+                  return m.group(1).strip()
+              return text.strip()
 
           def load_benchmarks():
               section("[1] LOAD BENCHMARK DATA")
@@ -271,7 +271,7 @@ jobs:
 
                   print(f"[ITEM RESULT] role={role_name} prediction={pred} correct={correct}")
                   print(f"[ITEM RESULT] role={role_name} generated_tokens={gen['generated_tokens']} seconds={gen['elapsed']:.4f} tps={gen['tps']:.4f}")
-                  print(f"[RAW OUTPUT] {repr(gen['text'][:500])}")
+                  print(f"[RAW OUTPUT] {repr(gen['text'][:300])}")
 
               summary = {
                   "role": role_name,
@@ -345,8 +345,8 @@ jobs:
                   if bucket == "teacher_only_correct":
                       print("[EDGE FOUND] Teacher succeeded where student failed.")
                       print(f"[EDGE GT] {task['ground_truth']}")
-                      print(f"[EDGE TEACHER] pred={t['prediction']} output={repr(t['raw_output'][:300])}")
-                      print(f"[EDGE STUDENT] pred={s['prediction']} output={repr(s['raw_output'][:300])}")
+                      print(f"[EDGE TEACHER] pred={t['prediction']} output={repr(t['raw_output'][:200])}")
+                      print(f"[EDGE STUDENT] pred={s['prediction']} output={repr(s['raw_output'][:200])}")
 
               teacher_only = [r for r in verbose_rows if r["bucket"] == "teacher_only_correct"]
 
@@ -358,24 +358,19 @@ jobs:
 
               return verbose_rows, teacher_only, summary
 
+          def acc_for_benchmark(outputs, benchmark_name):
+              rows = [x for x in outputs if x["benchmark"] == benchmark_name]
+              if not rows:
+                  return None, 0, 0
+              correct = sum(1 for x in rows if x["correct"])
+              return round(correct / len(rows), 4), correct, len(rows)
+
           def write_markdown_report(teacher_summary, student_summary, comparison_summary, teacher_only_rows):
               path = os.path.join(OUT_DIR, "report.md")
               with open(path, "w", encoding="utf-8") as f:
                   f.write("# Benchmark Gap Report\n\n")
-                  f.write("## Model summaries\n\n")
-                  f.write(f"- Teacher: `{teacher_summary['model']}` accuracy={teacher_summary['accuracy']} mean_tps={teacher_summary['mean_tps']}\n")
-                  f.write(f"- Student: `{student_summary['model']}` accuracy={student_summary['accuracy']} mean_tps={student_summary['mean_tps']}\n\n")
-
-                  f.write("## Overall buckets\n\n")
-                  for k, v in comparison_summary["overall"].items():
-                      f.write(f"- {k}: {v}\n")
-                  f.write("\n## Per-benchmark buckets\n\n")
-                  for bench, stats in comparison_summary["per_benchmark"].items():
-                      f.write(f"### {bench}\n")
-                      for k, v in stats.items():
-                          f.write(f"- {k}: {v}\n")
-                      f.write("\n")
-
+                  f.write(f"- Teacher accuracy: {teacher_summary['accuracy']}\n")
+                  f.write(f"- Student accuracy: {student_summary['accuracy']}\n\n")
                   f.write("## Teacher-correct / Student-wrong examples\n\n")
                   for row in teacher_only_rows:
                       f.write(f"### {row['id']} ({row['benchmark']})\n")
@@ -383,12 +378,8 @@ jobs:
                       f.write(f"- Teacher prediction: `{row['teacher_prediction']}`\n")
                       f.write(f"- Student prediction: `{row['student_prediction']}`\n")
                       f.write(f"- Question: {row['question']}\n")
-                      if "choices" in row:
-                          f.write("- Choices:\n")
-                          for ch in row["choices"]:
-                              f.write(f"  - {ch['label']}. {ch['text']}\n")
-                      f.write(f"- Teacher output: `{row['teacher_output'][:500]}`\n")
-                      f.write(f"- Student output: `{row['student_output'][:500]}`\n\n")
+                      f.write(f"- Teacher output: `{row['teacher_output'][:300]}`\n")
+                      f.write(f"- Student output: `{row['student_output'][:300]}`\n\n")
               return path
 
           def write_step_summary(teacher_summary, student_summary, comparison_summary):
@@ -403,13 +394,6 @@ jobs:
                   f.write(f"- Student-only-correct: **{comparison_summary['overall']['student_only_correct']}**\n")
                   f.write(f"- Both correct: **{comparison_summary['overall']['both_correct']}**\n")
                   f.write(f"- Both wrong: **{comparison_summary['overall']['both_wrong']}**\n")
-
-          def acc_for_benchmark(outputs, benchmark_name):
-              rows = [x for x in outputs if x["benchmark"] == benchmark_name]
-              if not rows:
-                  return None, 0, 0
-              correct = sum(1 for x in rows if x["correct"])
-              return round(correct / len(rows), 4), correct, len(rows)
 
           def print_console_summary(teacher_outputs, student_outputs, teacher_summary, student_summary, comparison_summary_serializable, teacher_only_rows, report_path):
               section("[5] FINAL CONSOLE SUMMARY")
@@ -455,18 +439,6 @@ jobs:
               print()
 
               print("-" * 140)
-              print("[PER-BENCHMARK BUCKETS]")
-              print("-" * 140)
-              for bench, stats in comparison_summary_serializable["per_benchmark"].items():
-                  print(f"{bench}:")
-                  print(f"  total                = {stats['total']}")
-                  print(f"  teacher_only_correct = {stats['teacher_only_correct']}")
-                  print(f"  student_only_correct = {stats['student_only_correct']}")
-                  print(f"  both_correct         = {stats['both_correct']}")
-                  print(f"  both_wrong           = {stats['both_wrong']}")
-              print()
-
-              print("-" * 140)
               print("[TOP TEACHER-EDGE EXAMPLES]")
               print("-" * 140)
               if not teacher_only_rows:
@@ -475,9 +447,9 @@ jobs:
                   for row in teacher_only_rows[:10]:
                       print(f"ID: {row['id']} | benchmark={row['benchmark']} | gt={row['ground_truth']}")
                       print(f"Teacher pred={row['teacher_prediction']} | Student pred={row['student_prediction']}")
-                      print(f"Question: {row['question'][:300]}")
-                      print(f"Teacher output: {row['teacher_output'][:200]}")
-                      print(f"Student output: {row['student_output'][:200]}")
+                      print(f"Question: {row['question'][:250]}")
+                      print(f"Teacher output: {row['teacher_output'][:180]}")
+                      print(f"Student output: {row['student_output'][:180]}")
                       print("-" * 140)
 
               print(
