@@ -1,0 +1,581 @@
+name: distillation-benchmark-gap-10m
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: distillation-benchmark-gap-10m-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark-gap:
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      VENV_DIR: ${{ github.workspace }}/.venv
+      OUT_DIR: ${{ github.workspace }}/benchmark_gap_outputs
+
+      TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-bf16
+      STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-bf16
+
+      GSM8K_LIMIT: "8"
+      ARC_LIMIT: "24"
+      MAX_NEW_TOKENS_GSM8K: "128"
+      MAX_NEW_TOKENS_ARC: "32"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-benchmark-gap-v2
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pip-benchmark-gap-
+            ${{ runner.os }}-${{ runner.arch }}-pip-
+
+      - name: Cache Hugging Face files
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-benchmark-gap-qwen25-1p5b-0p5b-v2
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-hf-benchmark-gap-qwen25-1p5b-0p5b-
+            ${{ runner.os }}-${{ runner.arch }}-hf-
+
+      - name: Create venv and install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv "${VENV_DIR}"
+          "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+          "${VENV_DIR}/bin/python" -m pip install mlx-lm datasets numpy
+
+      - name: Write benchmark comparison harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p scripts
+          mkdir -p "${OUT_DIR}"
+
+          cat > scripts/benchmark_gap.py << 'PY'
+          import json
+          import os
+          import platform
+          import re
+          import statistics
+          import sys
+          import time
+          from collections import defaultdict
+
+          import mlx.core as mx
+          from datasets import load_dataset
+          from mlx_lm import load
+
+          OUT_DIR = os.environ["OUT_DIR"]
+          TEACHER_MODEL = os.environ["TEACHER_MODEL"]
+          STUDENT_MODEL = os.environ["STUDENT_MODEL"]
+          GSM8K_LIMIT = int(os.environ["GSM8K_LIMIT"])
+          ARC_LIMIT = int(os.environ["ARC_LIMIT"])
+          MAX_NEW_TOKENS_GSM8K = int(os.environ["MAX_NEW_TOKENS_GSM8K"])
+          MAX_NEW_TOKENS_ARC = int(os.environ["MAX_NEW_TOKENS_ARC"])
+
+          def now():
+              return time.perf_counter()
+
+          def banner(title):
+              print("\n" + "=" * 140)
+              print(title)
+              print("=" * 140)
+
+          def section(title):
+              print("\n" + "-" * 140)
+              print(title)
+              print("-" * 140)
+
+          def greedy_generate(model, tok, prompt, max_new_tokens):
+              prompt_ids = tok.encode(prompt)
+              current = mx.array([prompt_ids])
+              out = []
+              t0 = now()
+
+              for i in range(max_new_tokens):
+                  logits = model(current)[:, -1, :]
+                  nxt = mx.argmax(logits, axis=-1)
+                  token_id = int(nxt.item())
+                  out.append(token_id)
+
+                  if i < 4 or (i + 1) % 16 == 0:
+                      recent = tok.decode(out[-8:])
+                      print(f"[GEN TRACE] step={i+1:03d} token_id={token_id} recent={repr(recent)}")
+
+                  current = mx.concatenate([current, nxt[None, :]], axis=1)
+                  if token_id == tok.eos_token_id:
+                      print(f"[GEN TRACE] eos at step={i+1}")
+                      break
+
+              elapsed = now() - t0
+              text = tok.decode(out).strip()
+              return {
+                  "text": text,
+                  "elapsed": elapsed,
+                  "generated_tokens": len(out),
+                  "tps": (len(out) / elapsed) if elapsed > 0 else 0.0,
+              }
+
+          def normalize_number(text):
+              if text is None:
+                  return None
+              t = text.replace(",", "")
+              matches = re.findall(r"-?\d+(?:\.\d+)?", t)
+              return matches[-1] if matches else None
+
+          def extract_gsm8k_gt(answer_text):
+              if "####" in answer_text:
+                  return normalize_number(answer_text.split("####")[-1])
+              return normalize_number(answer_text)
+
+          def extract_arc_gt(answer_key):
+              return answer_key.strip().upper()
+
+          def extract_arc_pred(text):
+              if text is None:
+                  return None
+              matches = re.findall(r"\b([A-E])\b", text.upper())
+              return matches[-1] if matches else None
+
+          def build_gsm8k_prompt(question):
+              return (
+                  "You are solving a GSM8K math word problem.\n"
+                  "Think briefly if needed, but end with exactly one line in this format:\n"
+                  "FINAL_ANSWER: <number>\n\n"
+                  f"Question:\n{question}\n"
+              )
+
+          def build_arc_prompt(question, labels, texts):
+              choices = "\n".join([f"{lab}. {txt}" for lab, txt in zip(labels, texts)])
+              return (
+                  "You are answering a multiple-choice science question from ARC-Challenge.\n"
+                  "Choose the single best option.\n"
+                  "End with exactly one line in this format:\n"
+                  "FINAL_ANSWER: <A/B/C/D/E>\n\n"
+                  f"Question:\n{question}\n\n"
+                  f"Choices:\n{choices}\n"
+              )
+
+          def extract_final_answer_line(text):
+              if text is None:
+                  return None
+              m = re.search(r"FINAL_ANSWER:\s*(.+)", text, re.IGNORECASE)
+              return m.group(1).strip() if m else text.strip()
+
+          def load_benchmarks():
+              section("[1] LOAD BENCHMARK DATA")
+              gsm8k = load_dataset("openai/gsm8k", "main", split="test")
+              arc = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")
+
+              tasks = []
+
+              for i, row in enumerate(gsm8k.select(range(min(GSM8K_LIMIT, len(gsm8k))))):
+                  gt = extract_gsm8k_gt(row["answer"])
+                  tasks.append({
+                      "benchmark": "gsm8k",
+                      "id": f"gsm8k-{i}",
+                      "question": row["question"],
+                      "ground_truth": gt,
+                      "prompt": build_gsm8k_prompt(row["question"]),
+                      "max_new_tokens": MAX_NEW_TOKENS_GSM8K,
+                  })
+
+              for i, row in enumerate(arc.select(range(min(ARC_LIMIT, len(arc))))):
+                  labels = row["choices"]["label"]
+                  texts = row["choices"]["text"]
+                  gt = extract_arc_gt(row["answerKey"])
+                  tasks.append({
+                      "benchmark": "arc_challenge",
+                      "id": f"arc-{i}",
+                      "question": row["question"],
+                      "choices": [{"label": l, "text": t} for l, t in zip(labels, texts)],
+                      "ground_truth": gt,
+                      "prompt": build_arc_prompt(row["question"], labels, texts),
+                      "max_new_tokens": MAX_NEW_TOKENS_ARC,
+                  })
+
+              print(f"[DATA SUMMARY] gsm8k_items={sum(t['benchmark']=='gsm8k' for t in tasks)}")
+              print(f"[DATA SUMMARY] arc_items={sum(t['benchmark']=='arc_challenge' for t in tasks)}")
+              print(f"[DATA SUMMARY] total_items={len(tasks)}")
+              return tasks
+
+          def score_prediction(task, generated_text):
+              final_text = extract_final_answer_line(generated_text)
+
+              if task["benchmark"] == "gsm8k":
+                  pred = normalize_number(final_text)
+                  gt = task["ground_truth"]
+                  correct = pred is not None and gt is not None and pred == gt
+                  return pred, correct
+
+              if task["benchmark"] == "arc_challenge":
+                  pred = extract_arc_pred(final_text)
+                  gt = task["ground_truth"]
+                  correct = pred is not None and pred == gt
+                  return pred, correct
+
+              raise RuntimeError(f"Unknown benchmark: {task['benchmark']}")
+
+          def run_model(model_name, tasks, role_name):
+              section(f"[2] LOAD {role_name.upper()} MODEL")
+              t0 = now()
+              model, tok = load(model_name)
+              model.eval()
+              load_seconds = now() - t0
+              print(f"[MODEL LOAD] role={role_name} seconds={load_seconds:.4f}")
+
+              outputs = []
+              tps_values = []
+
+              for idx, task in enumerate(tasks):
+                  print(f"\n[ITEM START] role={role_name} idx={idx+1}/{len(tasks)} benchmark={task['benchmark']} id={task['id']}")
+                  print(f"[QUESTION] {task['question']}")
+                  if task["benchmark"] == "arc_challenge":
+                      for ch in task["choices"]:
+                          print(f"[CHOICE] {ch['label']}. {ch['text']}")
+
+                  gen = greedy_generate(model, tok, task["prompt"], task["max_new_tokens"])
+                  pred, correct = score_prediction(task, gen["text"])
+                  tps_values.append(gen["tps"])
+
+                  item = {
+                      "id": task["id"],
+                      "benchmark": task["benchmark"],
+                      "ground_truth": task["ground_truth"],
+                      "raw_output": gen["text"],
+                      "prediction": pred,
+                      "correct": correct,
+                      "generated_tokens": gen["generated_tokens"],
+                      "seconds": round(gen["elapsed"], 4),
+                      "tps": round(gen["tps"], 4),
+                  }
+                  outputs.append(item)
+
+                  print(f"[ITEM RESULT] role={role_name} prediction={pred} correct={correct}")
+                  print(f"[ITEM RESULT] role={role_name} generated_tokens={gen['generated_tokens']} seconds={gen['elapsed']:.4f} tps={gen['tps']:.4f}")
+                  print(f"[RAW OUTPUT] {repr(gen['text'][:500])}")
+
+              summary = {
+                  "role": role_name,
+                  "model": model_name,
+                  "load_seconds": round(load_seconds, 4),
+                  "item_count": len(outputs),
+                  "accuracy": round(sum(1 for x in outputs if x["correct"]) / len(outputs), 4) if outputs else None,
+                  "mean_tps": round(statistics.mean(tps_values), 4) if tps_values else None,
+                  "min_tps": round(min(tps_values), 4) if tps_values else None,
+                  "max_tps": round(max(tps_values), 4) if tps_values else None,
+              }
+
+              return outputs, summary
+
+          def compare(tasks, teacher_outputs, student_outputs):
+              section("[4] COMPARE TEACHER VS STUDENT")
+              teacher_by_id = {x["id"]: x for x in teacher_outputs}
+              student_by_id = {x["id"]: x for x in student_outputs}
+
+              verbose_rows = []
+              counts = {
+                  "teacher_only_correct": 0,
+                  "student_only_correct": 0,
+                  "both_correct": 0,
+                  "both_wrong": 0,
+              }
+              per_benchmark = defaultdict(lambda: {
+                  "teacher_only_correct": 0,
+                  "student_only_correct": 0,
+                  "both_correct": 0,
+                  "both_wrong": 0,
+                  "total": 0,
+              })
+
+              for task in tasks:
+                  tid = task["id"]
+                  t = teacher_by_id[tid]
+                  s = student_by_id[tid]
+
+                  if t["correct"] and not s["correct"]:
+                      bucket = "teacher_only_correct"
+                  elif s["correct"] and not t["correct"]:
+                      bucket = "student_only_correct"
+                  elif s["correct"] and t["correct"]:
+                      bucket = "both_correct"
+                  else:
+                      bucket = "both_wrong"
+
+                  counts[bucket] += 1
+                  per_benchmark[task["benchmark"]][bucket] += 1
+                  per_benchmark[task["benchmark"]]["total"] += 1
+
+                  row = {
+                      "id": tid,
+                      "benchmark": task["benchmark"],
+                      "bucket": bucket,
+                      "question": task["question"],
+                      "ground_truth": task["ground_truth"],
+                      "teacher_prediction": t["prediction"],
+                      "teacher_correct": t["correct"],
+                      "teacher_output": t["raw_output"],
+                      "student_prediction": s["prediction"],
+                      "student_correct": s["correct"],
+                      "student_output": s["raw_output"],
+                  }
+                  if "choices" in task:
+                      row["choices"] = task["choices"]
+                  verbose_rows.append(row)
+
+                  print(f"[COMPARE] id={tid} benchmark={task['benchmark']} bucket={bucket}")
+                  if bucket == "teacher_only_correct":
+                      print("[EDGE FOUND] Teacher succeeded where student failed.")
+                      print(f"[EDGE GT] {task['ground_truth']}")
+                      print(f"[EDGE TEACHER] pred={t['prediction']} output={repr(t['raw_output'][:300])}")
+                      print(f"[EDGE STUDENT] pred={s['prediction']} output={repr(s['raw_output'][:300])}")
+
+              teacher_only = [r for r in verbose_rows if r["bucket"] == "teacher_only_correct"]
+
+              summary = {
+                  "overall": counts,
+                  "per_benchmark": per_benchmark,
+                  "teacher_only_correct_examples": len(teacher_only),
+              }
+
+              return verbose_rows, teacher_only, summary
+
+          def write_markdown_report(teacher_summary, student_summary, comparison_summary, teacher_only_rows):
+              path = os.path.join(OUT_DIR, "report.md")
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write("# Benchmark Gap Report\n\n")
+                  f.write("## Model summaries\n\n")
+                  f.write(f"- Teacher: `{teacher_summary['model']}` accuracy={teacher_summary['accuracy']} mean_tps={teacher_summary['mean_tps']}\n")
+                  f.write(f"- Student: `{student_summary['model']}` accuracy={student_summary['accuracy']} mean_tps={student_summary['mean_tps']}\n\n")
+
+                  f.write("## Overall buckets\n\n")
+                  for k, v in comparison_summary["overall"].items():
+                      f.write(f"- {k}: {v}\n")
+                  f.write("\n## Per-benchmark buckets\n\n")
+                  for bench, stats in comparison_summary["per_benchmark"].items():
+                      f.write(f"### {bench}\n")
+                      for k, v in stats.items():
+                          f.write(f"- {k}: {v}\n")
+                      f.write("\n")
+
+                  f.write("## Teacher-correct / Student-wrong examples\n\n")
+                  for row in teacher_only_rows:
+                      f.write(f"### {row['id']} ({row['benchmark']})\n")
+                      f.write(f"- Ground truth: `{row['ground_truth']}`\n")
+                      f.write(f"- Teacher prediction: `{row['teacher_prediction']}`\n")
+                      f.write(f"- Student prediction: `{row['student_prediction']}`\n")
+                      f.write(f"- Question: {row['question']}\n")
+                      if "choices" in row:
+                          f.write("- Choices:\n")
+                          for ch in row["choices"]:
+                              f.write(f"  - {ch['label']}. {ch['text']}\n")
+                      f.write(f"- Teacher output: `{row['teacher_output'][:500]}`\n")
+                      f.write(f"- Student output: `{row['student_output'][:500]}`\n\n")
+              return path
+
+          def write_step_summary(teacher_summary, student_summary, comparison_summary):
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if not step_summary:
+                  return
+              with open(step_summary, "a", encoding="utf-8") as f:
+                  f.write("## Benchmark Gap Summary\n\n")
+                  f.write(f"- Teacher accuracy: **{teacher_summary['accuracy']}**\n")
+                  f.write(f"- Student accuracy: **{student_summary['accuracy']}**\n")
+                  f.write(f"- Teacher-only-correct: **{comparison_summary['overall']['teacher_only_correct']}**\n")
+                  f.write(f"- Student-only-correct: **{comparison_summary['overall']['student_only_correct']}**\n")
+                  f.write(f"- Both correct: **{comparison_summary['overall']['both_correct']}**\n")
+                  f.write(f"- Both wrong: **{comparison_summary['overall']['both_wrong']}**\n")
+
+          def acc_for_benchmark(outputs, benchmark_name):
+              rows = [x for x in outputs if x["benchmark"] == benchmark_name]
+              if not rows:
+                  return None, 0, 0
+              correct = sum(1 for x in rows if x["correct"])
+              return round(correct / len(rows), 4), correct, len(rows)
+
+          def print_console_summary(teacher_outputs, student_outputs, teacher_summary, student_summary, comparison_summary_serializable, teacher_only_rows, report_path):
+              section("[5] FINAL CONSOLE SUMMARY")
+
+              teacher_gsm8k_acc, teacher_gsm8k_correct, teacher_gsm8k_total = acc_for_benchmark(teacher_outputs, "gsm8k")
+              teacher_arc_acc, teacher_arc_correct, teacher_arc_total = acc_for_benchmark(teacher_outputs, "arc_challenge")
+              student_gsm8k_acc, student_gsm8k_correct, student_gsm8k_total = acc_for_benchmark(student_outputs, "gsm8k")
+              student_arc_acc, student_arc_correct, student_arc_total = acc_for_benchmark(student_outputs, "arc_challenge")
+
+              overall = comparison_summary_serializable["overall"]
+
+              print("=" * 140)
+              print("[OVERALL RESULT SUMMARY]")
+              print("=" * 140)
+              print(f"Teacher Model: {teacher_summary['model']}")
+              print(f"Student Model: {student_summary['model']}")
+              print(f"Teacher Accuracy Overall: {teacher_summary['accuracy']}")
+              print(f"Student Accuracy Overall: {student_summary['accuracy']}")
+              print(f"Teacher Mean TPS: {teacher_summary['mean_tps']}")
+              print(f"Student Mean TPS: {student_summary['mean_tps']}")
+              print()
+
+              print("-" * 140)
+              print("[PER-BENCHMARK ACCURACY]")
+              print("-" * 140)
+              print(
+                  f"GSM8K           | Teacher: {teacher_gsm8k_acc} ({teacher_gsm8k_correct}/{teacher_gsm8k_total}) "
+                  f"| Student: {student_gsm8k_acc} ({student_gsm8k_correct}/{student_gsm8k_total})"
+              )
+              print(
+                  f"ARC-Challenge   | Teacher: {teacher_arc_acc} ({teacher_arc_correct}/{teacher_arc_total}) "
+                  f"| Student: {student_arc_acc} ({student_arc_correct}/{student_arc_total})"
+              )
+              print()
+
+              print("-" * 140)
+              print("[COMPARISON BUCKETS]")
+              print("-" * 140)
+              print(f"Teacher only correct : {overall['teacher_only_correct']}")
+              print(f"Student only correct : {overall['student_only_correct']}")
+              print(f"Both correct         : {overall['both_correct']}")
+              print(f"Both wrong           : {overall['both_wrong']}")
+              print()
+
+              print("-" * 140)
+              print("[PER-BENCHMARK BUCKETS]")
+              print("-" * 140)
+              for bench, stats in comparison_summary_serializable["per_benchmark"].items():
+                  print(f"{bench}:")
+                  print(f"  total                = {stats['total']}")
+                  print(f"  teacher_only_correct = {stats['teacher_only_correct']}")
+                  print(f"  student_only_correct = {stats['student_only_correct']}")
+                  print(f"  both_correct         = {stats['both_correct']}")
+                  print(f"  both_wrong           = {stats['both_wrong']}")
+              print()
+
+              print("-" * 140)
+              print("[TOP TEACHER-EDGE EXAMPLES]")
+              print("-" * 140)
+              if not teacher_only_rows:
+                  print("No teacher-only-correct examples found in this run.")
+              else:
+                  for row in teacher_only_rows[:10]:
+                      print(f"ID: {row['id']} | benchmark={row['benchmark']} | gt={row['ground_truth']}")
+                      print(f"Teacher pred={row['teacher_prediction']} | Student pred={row['student_prediction']}")
+                      print(f"Question: {row['question'][:300]}")
+                      print(f"Teacher output: {row['teacher_output'][:200]}")
+                      print(f"Student output: {row['student_output'][:200]}")
+                      print("-" * 140)
+
+              print(
+                  f"RESULT_LINE teacher_acc={teacher_summary['accuracy']} "
+                  f"student_acc={student_summary['accuracy']} "
+                  f"teacher_only_correct={overall['teacher_only_correct']} "
+                  f"student_only_correct={overall['student_only_correct']} "
+                  f"both_correct={overall['both_correct']} "
+                  f"both_wrong={overall['both_wrong']}"
+              )
+
+              print("=" * 140)
+              print("[JSON FINAL SUMMARY]")
+              print("=" * 140)
+              final_summary = {
+                  "teacher_summary": teacher_summary,
+                  "student_summary": student_summary,
+                  "comparison_summary": comparison_summary_serializable,
+                  "teacher_only_correct_preview_count": min(10, len(teacher_only_rows)),
+                  "report_path": report_path,
+              }
+              print(json.dumps(final_summary, indent=2))
+
+          def main():
+              os.makedirs(OUT_DIR, exist_ok=True)
+
+              banner("[SYSTEM INIT] DISTILLATION BENCHMARK GAP RUN")
+              print("[ENVIRONMENT]")
+              print(f"Python: {sys.version}")
+              print(f"Platform: {platform.platform()}")
+              print(f"Machine: {platform.machine()}")
+              print(f"Teacher model: {TEACHER_MODEL}")
+              print(f"Student model: {STUDENT_MODEL}")
+              print(f"GSM8K limit: {GSM8K_LIMIT}")
+              print(f"ARC limit: {ARC_LIMIT}")
+
+              tasks = load_benchmarks()
+
+              teacher_outputs, teacher_summary = run_model(TEACHER_MODEL, tasks, "teacher")
+              with open(os.path.join(OUT_DIR, "teacher_outputs.json"), "w", encoding="utf-8") as f:
+                  json.dump(teacher_outputs, f, indent=2)
+              with open(os.path.join(OUT_DIR, "teacher_summary.json"), "w", encoding="utf-8") as f:
+                  json.dump(teacher_summary, f, indent=2)
+
+              student_outputs, student_summary = run_model(STUDENT_MODEL, tasks, "student")
+              with open(os.path.join(OUT_DIR, "student_outputs.json"), "w", encoding="utf-8") as f:
+                  json.dump(student_outputs, f, indent=2)
+              with open(os.path.join(OUT_DIR, "student_summary.json"), "w", encoding="utf-8") as f:
+                  json.dump(student_summary, f, indent=2)
+
+              verbose_rows, teacher_only_rows, comparison_summary = compare(tasks, teacher_outputs, student_outputs)
+
+              with open(os.path.join(OUT_DIR, "comparison_verbose.json"), "w", encoding="utf-8") as f:
+                  json.dump(verbose_rows, f, indent=2)
+              with open(os.path.join(OUT_DIR, "teacher_only_correct.json"), "w", encoding="utf-8") as f:
+                  json.dump(teacher_only_rows, f, indent=2)
+
+              comparison_summary_serializable = {
+                  "overall": comparison_summary["overall"],
+                  "per_benchmark": {k: dict(v) for k, v in comparison_summary["per_benchmark"].items()},
+                  "teacher_only_correct_examples": comparison_summary["teacher_only_correct_examples"],
+              }
+
+              with open(os.path.join(OUT_DIR, "comparison_summary.json"), "w", encoding="utf-8") as f:
+                  json.dump(comparison_summary_serializable, f, indent=2)
+
+              report_path = write_markdown_report(
+                  teacher_summary,
+                  student_summary,
+                  comparison_summary_serializable,
+                  teacher_only_rows,
+              )
+              write_step_summary(teacher_summary, student_summary, comparison_summary_serializable)
+
+              print_console_summary(
+                  teacher_outputs,
+                  student_outputs,
+                  teacher_summary,
+                  student_summary,
+                  comparison_summary_serializable,
+                  teacher_only_rows,
+                  report_path,
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run benchmark comparison
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${VENV_DIR}/bin/python" scripts/benchmark_gap.py
+
+      - name: Upload benchmark gap outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-gap-outputs
+          path: |
+            ${{ github.workspace }}/benchmark_gap_outputs
+            ${{ github.workspace }}/scripts/benchmark_gap.py
