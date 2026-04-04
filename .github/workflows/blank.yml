@@ -1,14 +1,14 @@
-name: distillation-humaneval-gap-10m
+name: distillation-humaneval-teacher-edge-10m
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: distillation-humaneval-gap-10m-${{ github.ref }}
+  group: distillation-humaneval-teacher-edge-10m-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  humaneval-gap:
+  humaneval-teacher-edge:
     runs-on: macos-latest
     timeout-minutes: 10
 
@@ -17,12 +17,12 @@ jobs:
       HF_HOME: ${{ github.workspace }}/.hf-cache
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       VENV_DIR: ${{ github.workspace }}/.venv
-      OUT_DIR: ${{ github.workspace }}/humaneval_gap_outputs
+      OUT_DIR: ${{ github.workspace }}/humaneval_teacher_edge_outputs
 
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-bf16
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-bf16
 
-      HUMANEVAL_LIMIT: "6"
+      HUMANEVAL_LIMIT: "8"
       MAX_NEW_TOKENS_CODE: "64"
       EXEC_TIMEOUT_SECONDS: "4"
 
@@ -39,18 +39,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-gap-v4
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-v1
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-gap-
+            ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-
             ${{ runner.os }}-${{ runner.arch }}-pip-
 
       - name: Cache Hugging Face files
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-gap-qwen25-1p5b-0p5b-v4
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-v1
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-gap-qwen25-1p5b-0p5b-
+            ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-
             ${{ runner.os }}-${{ runner.arch }}-hf-
 
       - name: Create venv and install dependencies
@@ -61,14 +61,14 @@ jobs:
           "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
           "${VENV_DIR}/bin/python" -m pip install mlx-lm datasets numpy
 
-      - name: Write HumanEval comparison harness
+      - name: Write HumanEval teacher-edge harness
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p scripts
           mkdir -p "${OUT_DIR}"
 
-          cat > scripts/humaneval_gap.py << 'PY'
+          cat > scripts/humaneval_teacher_edge.py << 'PY'
           import ast
           import json
           import multiprocessing as mp
@@ -145,19 +145,98 @@ jobs:
                   f"{task['prompt']}\n"
               )
 
+          def prompt_stats(prompt):
+              lines = prompt.splitlines()
+              nonempty = [ln for ln in lines if ln.strip()]
+              text = prompt.lower()
+
+              features = {
+                  "nonempty_lines": len(nonempty),
+                  "has_recursion_word": ("recursive" in text or "recursion" in text),
+                  "has_string_word": ("string" in text or "substring" in text),
+                  "has_paren_word": ("paren" in text or "parentheses" in text),
+                  "has_tree_word": ("tree" in text or "binary tree" in text),
+                  "has_graph_word": ("graph" in text or "path" in text),
+                  "has_sort_word": ("sort" in text or "sorted" in text),
+                  "has_nested_hint": prompt.count("for ") >= 2 or prompt.count("while ") >= 2,
+                  "doc_examples": prompt.count(">>>"),
+              }
+              return features
+
+          def teacher_favorable_score(prompt):
+              s = prompt_stats(prompt)
+              score = 0
+
+              # Favor compact tasks
+              if s["nonempty_lines"] <= 12:
+                  score += 3
+              elif s["nonempty_lines"] <= 18:
+                  score += 1
+              else:
+                  score -= 2
+
+              # Favor simple numerical/list transformation vibes
+              lowered = prompt.lower()
+              if "float" in lowered or "int" in lowered or "list" in lowered:
+                  score += 1
+              if "return the decimal part" in lowered:
+                  score += 4
+              if "mean absolute deviation" in lowered:
+                  score += 4
+              if "below zero" in lowered:
+                  score += 1
+              if "intersperse" in lowered:
+                  score += 1
+
+              # Penalize likely harder structured tasks
+              if s["has_recursion_word"]:
+                  score -= 4
+              if s["has_string_word"]:
+                  score -= 2
+              if s["has_paren_word"]:
+                  score -= 3
+              if s["has_tree_word"]:
+                  score -= 4
+              if s["has_graph_word"]:
+                  score -= 4
+              if s["has_sort_word"]:
+                  score -= 2
+              if s["has_nested_hint"]:
+                  score -= 2
+
+              return score
+
           def load_tasks():
-              section("[1] LOAD HUMANEVAL DATA")
+              section("[1] LOAD AND FILTER HUMANEVAL DATA")
               ds = load_dataset("openai/openai_humaneval", split="test")
-              tasks = []
-              for i, row in enumerate(ds.select(range(min(HUMANEVAL_LIMIT, len(ds))))):
-                  tasks.append({
+
+              ranked = []
+              for row in ds:
+                  score = teacher_favorable_score(row["prompt"])
+                  ranked.append({
                       "task_id": row["task_id"],
                       "prompt": row["prompt"],
                       "test": row["test"],
                       "entry_point": row["entry_point"],
                       "max_new_tokens": MAX_NEW_TOKENS_CODE,
+                      "teacher_favorable_score": score,
                   })
-              print(f"[DATA SUMMARY] humaneval_items={len(tasks)}")
+
+              ranked.sort(key=lambda x: (-x["teacher_favorable_score"], x["task_id"]))
+              tasks = ranked[:HUMANEVAL_LIMIT]
+
+              print(f"[DATA SUMMARY] selected_items={len(tasks)}")
+              print("[SELECTED TASKS]")
+              for t in tasks:
+                  print(
+                      f"  task_id={t['task_id']} "
+                      f"entry_point={t['entry_point']} "
+                      f"score={t['teacher_favorable_score']}"
+                  )
+
+              with open(os.path.join(OUT_DIR, "selected_tasks.json"), "w", encoding="utf-8") as f:
+                  json.dump(tasks, f, indent=2)
+
               return tasks
 
           def truncate_generation(text):
@@ -358,6 +437,7 @@ jobs:
 
               for idx, task in enumerate(tasks):
                   print(f"\n[ITEM START] role={role_name} idx={idx+1}/{len(tasks)} task_id={task['task_id']}")
+                  print(f"[TASK SCORE] {task['teacher_favorable_score']}")
                   print("[PROMPT PREVIEW]")
                   print(task["prompt"][:500])
 
@@ -368,6 +448,7 @@ jobs:
                   item = {
                       "task_id": task["task_id"],
                       "entry_point": task["entry_point"],
+                      "task_score": task["teacher_favorable_score"],
                       "raw_output": gen["text"],
                       "candidate_body": body,
                       "passed": passed,
@@ -431,6 +512,7 @@ jobs:
                   row = {
                       "task_id": tid,
                       "entry_point": task["entry_point"],
+                      "task_score": task["teacher_favorable_score"],
                       "bucket": bucket,
                       "prompt": task["prompt"],
                       "teacher_passed": t["passed"],
@@ -444,7 +526,7 @@ jobs:
                   }
                   verbose_rows.append(row)
 
-                  print(f"[COMPARE] task_id={tid} bucket={bucket}")
+                  print(f"[COMPARE] task_id={tid} score={task['teacher_favorable_score']} bucket={bucket}")
                   if bucket == "teacher_only_pass":
                       print("[EDGE FOUND] Teacher passed where student failed.")
                       print(f"[EDGE TEACHER BODY] {repr(t['candidate_body'][:300])}")
@@ -462,12 +544,12 @@ jobs:
           def write_markdown_report(teacher_summary, student_summary, comparison_summary, teacher_only_rows):
               path = os.path.join(OUT_DIR, "report.md")
               with open(path, "w", encoding="utf-8") as f:
-                  f.write("# HumanEval Gap Report\n\n")
+                  f.write("# HumanEval Teacher-Edge Report\n\n")
                   f.write(f"- Teacher pass rate: {teacher_summary['pass_rate']}\n")
                   f.write(f"- Student pass rate: {student_summary['pass_rate']}\n\n")
                   f.write("## Teacher-pass / Student-fail examples\n\n")
                   for row in teacher_only_rows:
-                      f.write(f"### {row['task_id']}\n")
+                      f.write(f"### {row['task_id']} (score={row['task_score']})\n")
                       f.write(f"- Entry point: `{row['entry_point']}`\n")
                       f.write(f"- Prompt:\n```python\n{row['prompt']}\n```\n")
                       f.write(f"- Teacher body:\n```python\n{row['teacher_body'][:1200]}\n```\n")
@@ -476,19 +558,6 @@ jobs:
                           f.write(f"- Student error:\n```text\n{row['student_error'][:1200]}\n```\n")
                       f.write("\n")
               return path
-
-          def write_step_summary(teacher_summary, student_summary, comparison_summary):
-              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
-              if not step_summary:
-                  return
-              with open(step_summary, "a", encoding="utf-8") as f:
-                  f.write("## HumanEval Gap Summary\n\n")
-                  f.write(f"- Teacher pass rate: **{teacher_summary['pass_rate']}**\n")
-                  f.write(f"- Student pass rate: **{student_summary['pass_rate']}**\n")
-                  f.write(f"- Teacher-only-pass: **{comparison_summary['overall']['teacher_only_pass']}**\n")
-                  f.write(f"- Student-only-pass: **{comparison_summary['overall']['student_only_pass']}**\n")
-                  f.write(f"- Both pass: **{comparison_summary['overall']['both_pass']}**\n")
-                  f.write(f"- Both fail: **{comparison_summary['overall']['both_fail']}**\n")
 
           def print_console_summary(teacher_summary, student_summary, comparison_summary_serializable, teacher_only_rows, report_path):
               section("[5] FINAL CONSOLE SUMMARY")
@@ -521,7 +590,7 @@ jobs:
                   print("No teacher-only-pass examples found in this run.")
               else:
                   for row in teacher_only_rows[:10]:
-                      print(f"TASK: {row['task_id']} | entry_point={row['entry_point']}")
+                      print(f"TASK: {row['task_id']} | entry_point={row['entry_point']} | score={row['task_score']}")
                       print(f"Teacher passed={row['teacher_passed']} | Student passed={row['student_passed']}")
                       print(f"Prompt: {row['prompt'][:300]}")
                       print(f"Teacher body: {row['teacher_body'][:300]}")
@@ -555,7 +624,7 @@ jobs:
               mp.set_start_method("fork", force=True)
               os.makedirs(OUT_DIR, exist_ok=True)
 
-              banner("[SYSTEM INIT] DISTILLATION HUMANEVAL GAP RUN")
+              banner("[SYSTEM INIT] DISTILLATION HUMANEVAL TEACHER-EDGE RUN")
               print("[ENVIRONMENT]")
               print(f"Python: {sys.version}")
               print(f"Platform: {platform.platform()}")
@@ -569,14 +638,14 @@ jobs:
               tasks = load_tasks()
 
               teacher_outputs, teacher_summary = run_model(TEACHER_MODEL, tasks, "teacher")
+              student_outputs, student_summary = run_model(STUDENT_MODEL, tasks, "student")
+
               with open(os.path.join(OUT_DIR, "teacher_outputs.json"), "w", encoding="utf-8") as f:
                   json.dump(teacher_outputs, f, indent=2)
-              with open(os.path.join(OUT_DIR, "teacher_summary.json"), "w", encoding="utf-8") as f:
-                  json.dump(teacher_summary, f, indent=2)
-
-              student_outputs, student_summary = run_model(STUDENT_MODEL, tasks, "student")
               with open(os.path.join(OUT_DIR, "student_outputs.json"), "w", encoding="utf-8") as f:
                   json.dump(student_outputs, f, indent=2)
+              with open(os.path.join(OUT_DIR, "teacher_summary.json"), "w", encoding="utf-8") as f:
+                  json.dump(teacher_summary, f, indent=2)
               with open(os.path.join(OUT_DIR, "student_summary.json"), "w", encoding="utf-8") as f:
                   json.dump(student_summary, f, indent=2)
 
@@ -601,7 +670,6 @@ jobs:
                   comparison_summary_serializable,
                   teacher_only_rows,
               )
-              write_step_summary(teacher_summary, student_summary, comparison_summary_serializable)
 
               print_console_summary(
                   teacher_summary,
@@ -615,16 +683,16 @@ jobs:
               main()
           PY
 
-      - name: Run HumanEval comparison
+      - name: Run HumanEval teacher-edge comparison
         shell: bash
         run: |
           set -euxo pipefail
-          "${VENV_DIR}/bin/python" scripts/humaneval_gap.py
+          "${VENV_DIR}/bin/python" scripts/humaneval_teacher_edge.py
 
-      - name: Upload HumanEval gap outputs
+      - name: Upload HumanEval teacher-edge outputs
         uses: actions/upload-artifact@v4
         with:
-          name: humaneval-gap-outputs
+          name: humaneval-teacher-edge-outputs
           path: |
-            ${{ github.workspace }}/humaneval_gap_outputs
-            ${{ github.workspace }}/scripts/humaneval_gap.py
+            ${{ github.workspace }}/humaneval_teacher_edge_outputs
+            ${{ github.workspace }}/scripts/humaneval_teacher_edge.py
