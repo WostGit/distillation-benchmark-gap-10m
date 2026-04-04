@@ -22,8 +22,8 @@ jobs:
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-bf16
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-bf16
 
-      HUMANEVAL_LIMIT: "5"
-      HUMANEVAL_MIN_SCORE: "4"
+      HUMANEVAL_LIMIT: "4"
+      HUMANEVAL_MIN_SCORE: "8"
       MAX_NEW_TOKENS_CODE: "64"
       EXEC_TIMEOUT_SECONDS: "4"
 
@@ -40,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-v2
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-v3
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-
             ${{ runner.os }}-${{ runner.arch }}-pip-
@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-v2
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-v3
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-
             ${{ runner.os }}-${{ runner.arch }}-hf-
@@ -93,18 +93,22 @@ jobs:
           MAX_NEW_TOKENS_CODE = int(os.environ["MAX_NEW_TOKENS_CODE"])
           EXEC_TIMEOUT_SECONDS = int(os.environ["EXEC_TIMEOUT_SECONDS"])
 
+
           def now():
               return time.perf_counter()
+
 
           def banner(title):
               print("\n" + "=" * 140)
               print(title)
               print("=" * 140)
 
+
           def section(title):
               print("\n" + "-" * 140)
               print(title)
               print("-" * 140)
+
 
           def greedy_generate(model, tok, prompt, max_new_tokens):
               prompt_ids = tok.encode(prompt)
@@ -136,6 +140,7 @@ jobs:
                   "tps": (len(out) / elapsed) if elapsed > 0 else 0.0,
               }
 
+
           def build_generation_prompt(task):
               return (
                   "Complete the Python function below.\n"
@@ -145,6 +150,7 @@ jobs:
                   "Do not include markdown fences.\n\n"
                   f"{task['prompt']}\n"
               )
+
 
           def prompt_stats(prompt):
               lines = prompt.splitlines()
@@ -161,6 +167,7 @@ jobs:
                   "has_nested_hint": prompt.count("for ") >= 2 or prompt.count("while ") >= 2,
                   "doc_examples": prompt.count(">>>"),
               }
+
 
           def teacher_favorable_score(prompt):
               s = prompt_stats(prompt)
@@ -224,6 +231,7 @@ jobs:
 
               return score
 
+
           def load_tasks():
               section("[1] LOAD AND FILTER HUMANEVAL DATA")
               ds = load_dataset("openai/openai_humaneval", split="test")
@@ -260,6 +268,7 @@ jobs:
 
               return tasks
 
+
           def truncate_generation(text):
               if not text:
                   return ""
@@ -287,13 +296,6 @@ jobs:
 
               return text.strip()
 
-          def get_entry_indent(prompt, entry_point):
-              lines = prompt.splitlines()
-              target = f"def {entry_point}("
-              for idx, line in enumerate(lines):
-                  if line.lstrip().startswith(target):
-                      return 4
-              return 4
 
           def extract_function_block(code, entry_point):
               pattern = re.compile(rf"(^|\n)([ \t]*)def\s+{re.escape(entry_point)}\s*\(", re.MULTILINE)
@@ -320,6 +322,7 @@ jobs:
 
               return "\n".join(block)
 
+
           def extract_body_from_full_function(code, entry_point):
               fn_block = extract_function_block(code, entry_point)
               if not fn_block:
@@ -340,6 +343,7 @@ jobs:
                       return "\n".join(src_lines[start:end])
               return None
 
+
           def strip_prose_prefix(text):
               lines = text.splitlines()
               while lines and lines[0].strip():
@@ -356,6 +360,7 @@ jobs:
                       continue
                   break
               return "\n".join(lines).strip()
+
 
           def clean_body_candidate(text):
               text = strip_prose_prefix(text)
@@ -391,7 +396,8 @@ jobs:
 
               return "\n".join(kept)
 
-          def normalize_body(text, entry_point, entry_indent):
+
+          def normalize_body(text, entry_point):
               code = truncate_generation(text)
 
               full_body = extract_body_from_full_function(code, entry_point)
@@ -409,11 +415,10 @@ jobs:
               if not body.strip():
                   body = "pass"
 
-              body_lines = body.splitlines()
-
               cleaned_lines = []
-              for line in body_lines:
+              for line in body.splitlines():
                   stripped = line.strip()
+
                   if not stripped:
                       cleaned_lines.append("")
                       continue
@@ -425,8 +430,11 @@ jobs:
                   cleaned_lines.append(stripped)
 
               body = "\n".join(cleaned_lines).strip("\n")
-              indented = textwrap.indent(body if body else "pass", " " * entry_indent)
-              return indented
+              if not body:
+                  body = "pass"
+
+              return textwrap.indent(body, "    ")
+
 
           def _exec_worker(code, queue):
               try:
@@ -436,9 +444,9 @@ jobs:
               except Exception:
                   queue.put({"passed": False, "error": traceback.format_exc()})
 
+
           def run_tests(candidate_text, task):
-              entry_indent = get_entry_indent(task["prompt"], task["entry_point"])
-              body = normalize_body(candidate_text, task["entry_point"], entry_indent)
+              body = normalize_body(candidate_text, task["entry_point"])
               full_code = task["prompt"] + "\n" + body + "\n" + task["test"] + f"\ncheck({task['entry_point']})\n"
 
               queue = mp.Queue()
@@ -456,6 +464,7 @@ jobs:
 
               result = queue.get()
               return result["passed"], result["error"], full_code, body
+
 
           def run_model(model_name, tasks, role_name):
               section(f"[2] LOAD {role_name.upper()} MODEL")
@@ -512,6 +521,7 @@ jobs:
               }
 
               return outputs, summary
+
 
           def compare(tasks, teacher_outputs, student_outputs):
               section("[4] COMPARE TEACHER VS STUDENT")
@@ -574,6 +584,7 @@ jobs:
               }
               return verbose_rows, teacher_only, summary
 
+
           def write_markdown_report(teacher_summary, student_summary, comparison_summary, teacher_only_rows):
               path = os.path.join(OUT_DIR, "report.md")
               with open(path, "w", encoding="utf-8") as f:
@@ -591,6 +602,7 @@ jobs:
                           f.write(f"- Student error:\n```text\n{row['student_error'][:1200]}\n```\n")
                       f.write("\n")
               return path
+
 
           def print_console_summary(teacher_summary, student_summary, comparison_summary_serializable, teacher_only_rows, report_path):
               section("[5] FINAL CONSOLE SUMMARY")
@@ -652,6 +664,7 @@ jobs:
                   "report_path": report_path,
               }
               print(json.dumps(final_summary, indent=2))
+
 
           def main():
               mp.set_start_method("fork", force=True)
