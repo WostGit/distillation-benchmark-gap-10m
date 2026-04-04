@@ -22,7 +22,8 @@ jobs:
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-bf16
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-bf16
 
-      HUMANEVAL_LIMIT: "8"
+      HUMANEVAL_LIMIT: "5"
+      HUMANEVAL_MIN_SCORE: "4"
       MAX_NEW_TOKENS_CODE: "64"
       EXEC_TIMEOUT_SECONDS: "4"
 
@@ -39,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-v2
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-pip-humaneval-teacher-edge-
             ${{ runner.os }}-${{ runner.arch }}-pip-
@@ -48,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
-          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-v2
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-hf-humaneval-teacher-edge-qwen25-1p5b-0p5b-
             ${{ runner.os }}-${{ runner.arch }}-hf-
@@ -73,7 +74,6 @@ jobs:
           import json
           import multiprocessing as mp
           import os
-          import platform
           import re
           import statistics
           import sys
@@ -89,6 +89,7 @@ jobs:
           TEACHER_MODEL = os.environ["TEACHER_MODEL"]
           STUDENT_MODEL = os.environ["STUDENT_MODEL"]
           HUMANEVAL_LIMIT = int(os.environ["HUMANEVAL_LIMIT"])
+          HUMANEVAL_MIN_SCORE = int(os.environ["HUMANEVAL_MIN_SCORE"])
           MAX_NEW_TOKENS_CODE = int(os.environ["MAX_NEW_TOKENS_CODE"])
           EXEC_TIMEOUT_SECONDS = int(os.environ["EXEC_TIMEOUT_SECONDS"])
 
@@ -149,8 +150,7 @@ jobs:
               lines = prompt.splitlines()
               nonempty = [ln for ln in lines if ln.strip()]
               text = prompt.lower()
-
-              features = {
+              return {
                   "nonempty_lines": len(nonempty),
                   "has_recursion_word": ("recursive" in text or "recursion" in text),
                   "has_string_word": ("string" in text or "substring" in text),
@@ -161,47 +161,65 @@ jobs:
                   "has_nested_hint": prompt.count("for ") >= 2 or prompt.count("while ") >= 2,
                   "doc_examples": prompt.count(">>>"),
               }
-              return features
 
           def teacher_favorable_score(prompt):
               s = prompt_stats(prompt)
+              lowered = prompt.lower()
               score = 0
 
-              # Favor compact tasks
-              if s["nonempty_lines"] <= 12:
-                  score += 3
-              elif s["nonempty_lines"] <= 18:
-                  score += 1
+              if s["nonempty_lines"] <= 10:
+                  score += 5
+              elif s["nonempty_lines"] <= 14:
+                  score += 2
               else:
-                  score -= 2
+                  score -= 4
 
-              # Favor simple numerical/list transformation vibes
-              lowered = prompt.lower()
-              if "float" in lowered or "int" in lowered or "list" in lowered:
+              if "float" in lowered:
+                  score += 2
+              if "int" in lowered:
                   score += 1
-              if "return the decimal part" in lowered:
+              if "list" in lowered:
+                  score += 1
+              if "mean" in lowered:
                   score += 4
-              if "mean absolute deviation" in lowered:
+              if "average" in lowered:
+                  score += 3
+              if "decimal part" in lowered:
+                  score += 5
+              if "absolute" in lowered:
+                  score += 2
+              if "deviation" in lowered:
                   score += 4
+
               if "below zero" in lowered:
                   score += 1
-              if "intersperse" in lowered:
+              if "closer" in lowered:
                   score += 1
 
-              # Penalize likely harder structured tasks
               if s["has_recursion_word"]:
-                  score -= 4
+                  score -= 6
               if s["has_string_word"]:
-                  score -= 2
+                  score -= 5
               if s["has_paren_word"]:
-                  score -= 3
+                  score -= 6
               if s["has_tree_word"]:
-                  score -= 4
+                  score -= 8
               if s["has_graph_word"]:
-                  score -= 4
+                  score -= 8
               if s["has_sort_word"]:
-                  score -= 2
+                  score -= 3
               if s["has_nested_hint"]:
+                  score -= 5
+              if s["doc_examples"] >= 3:
+                  score -= 2
+
+              if "separate" in lowered:
+                  score -= 3
+              if "group" in lowered:
+                  score -= 3
+              if "balanced" in lowered:
+                  score -= 4
+              if "intersperse" in lowered:
                   score -= 2
 
               return score
@@ -223,8 +241,11 @@ jobs:
                   })
 
               ranked.sort(key=lambda x: (-x["teacher_favorable_score"], x["task_id"]))
-              tasks = ranked[:HUMANEVAL_LIMIT]
+              filtered = [x for x in ranked if x["teacher_favorable_score"] >= HUMANEVAL_MIN_SCORE]
+              tasks = filtered[:HUMANEVAL_LIMIT]
 
+              print(f"[DATA SUMMARY] candidate_items={len(ranked)}")
+              print(f"[DATA SUMMARY] filtered_items={len(filtered)}")
               print(f"[DATA SUMMARY] selected_items={len(tasks)}")
               print("[SELECTED TASKS]")
               for t in tasks:
@@ -271,10 +292,6 @@ jobs:
               target = f"def {entry_point}("
               for idx, line in enumerate(lines):
                   if line.lstrip().startswith(target):
-                      if idx + 1 < len(lines):
-                          next_line = lines[idx + 1]
-                          if next_line.strip():
-                              return len(next_line) - len(next_line.lstrip(" "))
                       return 4
               return 4
 
@@ -392,7 +409,23 @@ jobs:
               if not body.strip():
                   body = "pass"
 
-              indented = textwrap.indent(body, " " * entry_indent)
+              body_lines = body.splitlines()
+
+              cleaned_lines = []
+              for line in body_lines:
+                  stripped = line.strip()
+                  if not stripped:
+                      cleaned_lines.append("")
+                      continue
+
+                  if stripped.startswith("#"):
+                      cleaned_lines.append(stripped)
+                      continue
+
+                  cleaned_lines.append(stripped)
+
+              body = "\n".join(cleaned_lines).strip("\n")
+              indented = textwrap.indent(body if body else "pass", " " * entry_indent)
               return indented
 
           def _exec_worker(code, queue):
@@ -627,11 +660,10 @@ jobs:
               banner("[SYSTEM INIT] DISTILLATION HUMANEVAL TEACHER-EDGE RUN")
               print("[ENVIRONMENT]")
               print(f"Python: {sys.version}")
-              print(f"Platform: {platform.platform()}")
-              print(f"Machine: {platform.machine()}")
               print(f"Teacher model: {TEACHER_MODEL}")
               print(f"Student model: {STUDENT_MODEL}")
               print(f"HumanEval limit: {HUMANEVAL_LIMIT}")
+              print(f"HumanEval min score: {HUMANEVAL_MIN_SCORE}")
               print(f"Max new tokens: {MAX_NEW_TOKENS_CODE}")
               print(f"Exec timeout seconds: {EXEC_TIMEOUT_SECONDS}")
 
